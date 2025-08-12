@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>leaflet map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .parking-icon {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background-color: #3366cc;
+            color: white;
+            font-weight: bold;
+            font-size: 14px;
+            text-align: center;
+            line-height: 20px;
+        }
+
+        .gate-icon {
+            width: 28px;
+            height: 28px;
+            text-align: center;
+            line-height: 24px;
+            font-weight: bold;
+            color: #808080;
+            font-size: 28px;
+        }
+
+        .building-label {
+            pointer-events: none;
+            padding: 2px 6px;
+            background: rgba(255, 255, 255, .85);
+            border: 1px solid #aaa;
+            border-radius: 6px;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+
+<body>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <div id="map"></div>
+
+    <script>
+        // ================== 기본 지도 ==================
+        const map = L.map("map", {
+            center: [37.595719, 127.05373],
+            zoom: 16,
+            minZoom: 16, // 줌 아웃은 16까지만
+            maxZoom: 20
+        });
+
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; OpenStreetMap contributors & CartoDB',
+            subdomains: 'abcd',
+            maxZoom: 20
+        }).addTo(map);
+
+        // ================== 전역 유틸 ==================
+        let highlightedLayer = null; // { layer, layerGroup }
+
+        // 이름 + 영문명 팝업 HTML 구성
+        function buildNameHtml(feature) {
+            const name = feature?.properties?.name ?? '이름 없음';
+            const intName = feature?.properties?.int_name ?? '';
+            return intName ? `<b>${name}</b><br>${intName}` : `<b>${name}</b>`;
+        }
+
+        // 원본 스타일 저장 (circleMarker/폴리곤 공통)
+        function rememberStyle(l) {
+            if (!l._origStyle && l.options && typeof l.setStyle === 'function') {
+                l._origStyle = { ...l.options };
+            }
+        }
+
+        // 스타일 복원: GeoJSON의 style 또는 개별 저장본
+        function restoreStyle(layerGroup, l) {
+            const hasGeoJsonStyle = !!(layerGroup && typeof layerGroup.resetStyle === 'function' && layerGroup.options?.style);
+            if (hasGeoJsonStyle) {
+                layerGroup.resetStyle(l);
+            } else if (l._origStyle && typeof l.setStyle === 'function') {
+                l.setStyle(l._origStyle);
+            }
+        }
+
+        function clearHighlight() {
+            if (!highlightedLayer) return;
+            const { layerGroup, layer } = highlightedLayer;
+            try {
+                restoreStyle(layerGroup, layer);
+            } catch (e) {
+                console.warn('restoreStyle 실패:', e);
+            } finally {
+                highlightedLayer = null;
+            }
+            map.closePopup();
+        }
+
+        function applyHighlight(layerGroup, layer, e, feature) {
+            // 기본 동작 + 버블링 모두 차단
+            L.DomEvent.stop(e);
+
+            clearHighlight();
+
+            // 폴리곤/라인/circleMarker에 강조 적용
+            if (layer && typeof layer.setStyle === 'function') {
+                layer.setStyle({ color: '#ff6600', weight: 0, fillColor: '#ffa500', fillOpacity: 0.9 });
+                if (layer.bringToFront) layer.bringToFront();
+            }
+
+            const popupContent = buildNameHtml(feature);
+            L.popup().setLatLng(e.latlng).setContent(popupContent).openOn(map);
+
+            highlightedLayer = { layer, layerGroup };
+        }
+
+        // 배경 클릭 시 해제
+        map.on('click', clearHighlight);
+
+        // ESC 키로 해제 (접근성)
+        map.getContainer().tabIndex = 0; // 포커스 가능
+        map.getContainer().addEventListener('keydown', (ev) => {
+            if (ev.key === 'Escape') clearHighlight();
+        });
+
+        // === 전역 유틸: 피처 기반 라벨 생성 (위치는 centeroid_* 사용) ===
+        function createLabelForFeature(feature, html = '', className = 'building-label') {
+            const p = feature?.properties ?? {};
+            const lat = p.centeroid_ycoord; // Y가 lat
+            const lng = p.centeroid_xcoord; // X가 lng
+            if (typeof lat !== 'number' || typeof lng !== 'number') return null;
+
+            return L.marker([lat, lng], {
+                icon: L.divIcon({
+                    className,
+                    html,
+                    iconSize: null,
+                    iconAnchor: [30, 10]
+                }),
+                interactive: false
+            });
+        }
+
+        // === 전역 유틸: 라벨 텍스트/클래스 갱신 ===
+        function setLabelText(labelMarker, html = '', className = 'building-label') {
+            if (!labelMarker) return;
+            labelMarker.setIcon(L.divIcon({
+                className,
+                html,
+                iconSize: null,
+                iconAnchor: [30, 10]
+            }));
+        }
+
+
+        // ================== 레이어 로딩 ==================
+
+        // Campusarea (클릭 비활성)
+        fetch('./data/campusarea.geojson')
+            .then(r => r.json())
+            .then(campusarea => {
+                L.geoJSON(campusarea, {
+                    interactive: false,
+                    style: function (feature) {
+                        const fid = feature.properties.fid;
+                        return {
+                            color: 'black', // 외곽선 색
+                            weight: 0,
+                            fillColor: fid === 1 ? '#e7ebc7' : (fid === 2 ? '#f3d3d4' : 'gray'),
+                            fillOpacity: 1
+                        };
+                    }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Building (클릭 활성)
+        fetch('./data/building.geojson')
+            .then(r => r.json())
+            .then(data => {
+                const buildingLayer = L.geoJSON(data, {
+                    style: { color: '#666', weight: 1, fillColor: '#beb5ae', fillOpacity: 1 },
+                    onEachFeature: (feature, layer) => {
+                        rememberStyle(layer);
+                        layer.on('click', (e) => applyHighlight(buildingLayer, layer, e, feature));
+
+                        // 라벨 생성만 (빈 텍스트)
+                        layer._label = createLabelForFeature(feature, '');
+                    }
+                }).addTo(map);
+
+                // 초기 실행 & 줌 변화 시 처리
+                const handleZoom = () => {
+                    const z = map.getZoom();
+                    buildingLayer.eachLayer(l => {
+                        const p = l.feature?.properties ?? {};
+                        const fid = p.fid;
+                        if (!l._label) return;
+
+                        let show = false;
+                        let text = '';
+
+                        if (z === 16 || z === 17) {
+                            // fid 2,4,58,62만 simplified name
+                            if ([2, 4, 58, 62].includes(fid)) {
+                                text = p['simplified name'] || p.name || '';
+                                show = !!text;
+                            }
+                        } else if (z === 18) {
+                            // 제외 fid 외에는 simplified name만
+                            if (![26, 47, 48, 49, 50, 52].includes(fid)) {
+                                text = p['simplified name'] || '';
+                                // '('가 맨 앞이면 줄바꿈 X, 그 외에는 '<br>('로 치환
+                                text = text.replace(/\(/g, (match, offset) => (offset === 0 ? '(' : '<br>('));
+                                // 가운데 정렬
+                                text = `<div style="text-align:center;">${text}</div>`;
+                                show = !!(p['simplified name']);
+                            }
+                        } else if (z >= 19) {
+                            // 19부터는 name 우선 (원하면 여기에도 '(' 줄바꿈 넣을 수 있음)
+                            text = p.name || p['simplified name'] || '';
+                            text = text.replace(/\(/g, (m, offset) => (offset === 0 ? '(' : '<br>('));
+                            text = `<div style="text-align:center;">${text}</div>`;
+                            show = !!text;
+                        }
+
+                        if (show) {
+                            setLabelText(l._label, text);
+                            if (!map.hasLayer(l._label)) l._label.addTo(map);
+                        } else {
+                            if (map.hasLayer(l._label)) map.removeLayer(l._label);
+                        }
+                    });
+                };
+
+
+                map.on('zoomend', handleZoom);
+                handleZoom(); // 초기 실행
+            })
+            .catch(console.error);
+
+
+        // Parking (면) - 클릭 비활성
+        fetch('./data/parking.geojson')
+            .then(r => r.json())
+            .then(data => {
+                L.geoJSON(data, {
+                    interactive: false,
+                    style: { color: '#a8a09a', weight: 0, fillColor: '#e2ddda', fillOpacity: 1 }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Forest (면) - 클릭 비활성
+        fetch('./data/forest.geojson')
+            .then(r => r.json())
+            .then(data => {
+                L.geoJSON(data, {
+                    interactive: false,
+                    style: { color: '#a8a09a', weight: 0, fillColor: '#b6c688', fillOpacity: 1 }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Grass (면) - 클릭 비활성
+        fetch('./data/grass.geojson')
+            .then(r => r.json())
+            .then(data => {
+                L.geoJSON(data, {
+                    interactive: false,
+                    style: { color: '#a8a09a', weight: 0, fillColor: '#cdd7a5', fillOpacity: 1 }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Pond (면) - 클릭 비활성
+        fetch('./data/pond.geojson')
+            .then(r => r.json())
+            .then(data => {
+                L.geoJSON(data, {
+                    interactive: false,
+                    style: { color: '#a8a09a', weight: 0, fillColor: '#b8cee3', fillOpacity: 1 }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Stair/Statue (면) - 일부 fid만 클릭 활성 예시
+        fetch('./data/stairstatue.geojson')
+            .then(r => r.json())
+            .then(data => {
+                const stairstatue = L.geoJSON(data, {
+                    style: { color: '#a8a09a', weight: 0, fillColor: '#ecebda', fillOpacity: 1 },
+                    onEachFeature: (feature, layer) => {
+                        if (feature.properties?.fid === 3) {
+                            rememberStyle(layer);
+                            layer.on('click', (e) => applyHighlight(stairstatue, layer, e, feature));
+                        }
+                    }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Playground (면) - 일부 fid만 클릭 활성 예시
+        fetch('./data/playground.geojson')
+            .then(r => r.json())
+            .then(data => {
+                const playground = L.geoJSON(data, {
+                    style: { color: '#a8a09a', weight: 0, fillColor: '#cbdfac', fillOpacity: 1 },
+                    onEachFeature: (feature, layer) => {
+                        if (feature.properties?.fid === 7) {
+                            rememberStyle(layer);
+                            layer.on('click', (e) => applyHighlight(playground, layer, e, feature));
+                        }
+                    }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Road (선) - 클릭 비활성
+        fetch('./data/road.geojson')
+            .then(r => r.json())
+            .then(data => {
+                L.geoJSON(data, {
+                    interactive: false,
+                    style: { color: '#ffffff', weight: 4, opacity: 1 }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Pedestrian (선) - 클릭 비활성
+        fetch('./data/pedestrian.geojson')
+            .then(r => r.json())
+            .then(data => {
+                L.geoJSON(data, {
+                    interactive: false,
+                    style: { color: '#ffffff', weight: 1, opacity: 1, dashArray: '5,5' }
+                }).addTo(map);
+            })
+            .catch(console.error);
+
+        // Parkinglot (점) - circleMarker로 클릭 활성
+        let parkinglotLayer;
+        fetch('./data/parkinglot.geojson')
+            .then(r => r.json())
+            .then(data => {
+                const parkingIcon = L.divIcon({
+                    className: 'parking-icon',
+                    html: 'P',
+                    iconSize: [20, 20],
+                    iconAnchor: [14, 1]
+                });
+                parkinglotLayer = L.geoJSON(data, {
+                    pointToLayer: (feature, latlng) => L.marker(latlng, { icon: parkingIcon }),
+                    onEachFeature: (feature, layer) => {
+                        layer.on('click', e => applyHighlight(parkinglotLayer, layer, e, feature));
+                    }
+                });
+
+                // 줌 변화에 따른 표시/숨김
+                map.on('zoomend', () => {
+                    if (map.getZoom() >= 18) {
+                        if (!map.hasLayer(parkinglotLayer)) map.addLayer(parkinglotLayer);
+                    } else {
+                        if (map.hasLayer(parkinglotLayer)) map.removeLayer(parkinglotLayer);
+                    }
+                });
+            })
+            .catch(console.error);
+
+        // Gate (점) - circleMarker로 클릭 활성
+        let gateLayer;
+        fetch('./data/gate.geojson')
+            .then(r => r.json())
+            .then(data => {
+                const gateIcon = L.divIcon({
+                    className: 'gate-icon',
+                    html: '&#x1F3DB;',
+                    iconSize: [28, 28],
+                    iconAnchor: [14, 14]
+                });
+                gateLayer = L.geoJSON(data, {
+                    pointToLayer: (feature, latlng) => L.marker(latlng, { icon: gateIcon }),
+                    onEachFeature: (feature, layer) => {
+                        rememberStyle(layer);
+                        layer.on('click', e => applyHighlight(gateLayer, layer, e, feature));
+                    }
+                });
+
+                // 줌 변화에 따른 표시/숨김
+                map.on('zoomend', () => {
+                    if (map.getZoom() >= 18) {
+                        if (!map.hasLayer(gateLayer)) map.addLayer(gateLayer);
+                    } else {
+                        if (map.hasLayer(gateLayer)) map.removeLayer(gateLayer);
+                    }
+                });
+            })
+            .catch(console.error);
+
+
+    </script>
+</body>
+
+</html>
